@@ -53,11 +53,12 @@ pub fn jsonl_to_subframe(line: &str) -> Option<Subframe> {
                 payload,
             })
         }
-        "call_start" | "call_end" | "stream_info" => {
+        "call_start" | "call_end" | "stream_info" | "location" => {
             let subframe_type = match type_str {
                 "call_start" => SubframeType::CallStart,
                 "call_end" => SubframeType::CallEnd,
                 "stream_info" => SubframeType::StreamInfo,
+                "location" => SubframeType::Location,
                 _ => return None,
             };
             let data = v.get("data").cloned().unwrap_or(serde_json::json!({}));

@@ -14,6 +14,8 @@ pub enum SubframeType {
     CallEnd = 0x03,
     /// Substream metadata (sent on subscribe and on change). Payload is JSON.
     StreamInfo = 0x04,
+    /// Unit location report (GPS from P25 LRRP or external). Payload is JSON.
+    Location = 0x05,
 }
 
 impl SubframeType {
@@ -23,6 +25,7 @@ impl SubframeType {
             0x02 => Some(Self::CallStart),
             0x03 => Some(Self::CallEnd),
             0x04 => Some(Self::StreamInfo),
+            0x05 => Some(Self::Location),
             _ => None,
         }
     }
@@ -33,6 +36,7 @@ impl SubframeType {
             Self::CallStart => "call_start",
             Self::CallEnd => "call_end",
             Self::StreamInfo => "stream_info",
+            Self::Location => "location",
         }
     }
 }
