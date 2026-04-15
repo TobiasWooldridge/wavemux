@@ -75,7 +75,16 @@ impl Codec {
         }
     }
 
-    pub fn from_str(s: &str) -> Option<Self> {
+    /// Parse the wire-format string name into a [`Codec`]. Named
+    /// `parse_str` rather than `from_str` so it doesn't shadow
+    /// `std::str::FromStr::from_str` — clippy's
+    /// `should_implement_trait` rule otherwise fires because a
+    /// naïve `from_str` method on a type with this signature looks
+    /// like a broken `FromStr` impl. The Option return is the right
+    /// shape for JSONL parsing where a missing codec short-circuits
+    /// the whole frame via `?`, so implementing `FromStr` with
+    /// Result<_, Err> would just push `.ok()?` onto every call site.
+    pub fn parse_str(s: &str) -> Option<Self> {
         match s {
             "pcm16le" => Some(Self::Pcm16Le),
             "pcm16le_8k" => Some(Self::Pcm16Le8k),
@@ -319,7 +328,7 @@ mod tests {
             Codec::Opus,
             Codec::ImbeRaw,
         ] {
-            assert_eq!(Codec::from_str(c.as_str()), Some(c));
+            assert_eq!(Codec::parse_str(c.as_str()), Some(c));
         }
     }
 }

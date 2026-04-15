@@ -42,7 +42,7 @@ pub fn jsonl_to_subframe(line: &str) -> Option<Subframe> {
     match type_str {
         "audio" => {
             let codec_str = v.get("codec")?.as_str()?;
-            let codec = Codec::from_str(codec_str)?;
+            let codec = Codec::parse_str(codec_str)?;
             let b64 = v.get("samples_b64")?.as_str()?;
             let payload = BASE64.decode(b64).ok()?;
             Some(Subframe {
