@@ -53,11 +53,12 @@ pub fn jsonl_to_subframe(line: &str) -> Option<Subframe> {
                 payload,
             })
         }
-        "call_start" | "call_end" | "stream_info" | "location" => {
+        "call_start" | "call_end" | "stream_info" | "call_metadata_update" | "location" => {
             let subframe_type = match type_str {
                 "call_start" => SubframeType::CallStart,
                 "call_end" => SubframeType::CallEnd,
                 "stream_info" => SubframeType::StreamInfo,
+                "call_metadata_update" => SubframeType::CallMetadataUpdate,
                 "location" => SubframeType::Location,
                 _ => return None,
             };
@@ -120,6 +121,29 @@ mod tests {
         assert_eq!(parsed.subframe_type, SubframeType::CallEnd);
         let data: serde_json::Value = serde_json::from_slice(&parsed.payload).unwrap();
         assert_eq!(data["duration_ms"], 4200);
+    }
+
+    #[test]
+    fn call_metadata_update_roundtrip() {
+        // WaveCatch#71: mid-call encryption state flows through this
+        // subframe type so the UI can upgrade a clear-at-grant call
+        // to "encrypted + muted" or "encrypted + decoded" without
+        // losing the original CallStart metadata.
+        let metadata = serde_json::json!({
+            "encrypted": true,
+            "algorithm_id": 0xAA,
+            "decrypted": false,
+        });
+        let sf = Subframe::control(7, SubframeType::CallMetadataUpdate, 42, &metadata);
+        let line = subframe_to_jsonl(&sf);
+        let parsed = jsonl_to_subframe(&line).unwrap();
+        assert_eq!(parsed.substream_id, 7);
+        assert_eq!(parsed.subframe_type, SubframeType::CallMetadataUpdate);
+        assert_eq!(parsed.source_id, 42);
+        let data: serde_json::Value = serde_json::from_slice(&parsed.payload).unwrap();
+        assert_eq!(data["encrypted"], true);
+        assert_eq!(data["algorithm_id"], 0xAA);
+        assert_eq!(data["decrypted"], false);
     }
 
     #[test]

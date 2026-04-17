@@ -14,8 +14,20 @@ pub enum SubframeType {
     CallEnd = 0x03,
     /// Substream metadata (sent on subscribe and on change). Payload is JSON.
     StreamInfo = 0x04,
+    /// Mid-call metadata update. Payload is JSON; conceptually a diff
+    /// against the `CallStart` metadata (UI merges the new fields into
+    /// its per-call state). Currently used to surface per-call state
+    /// that only becomes observable mid-call:
+    ///
+    ///   - Encrypted-call detection from LDU2 ESS — `encrypted`,
+    ///     `algorithm_id`, `decrypted` fields (WaveCatch#71).
+    ///
+    /// Clients that don't recognise the frame type should skip it
+    /// forward-compatibly — adding new mid-call metadata doesn't
+    /// require a major-version bump.
+    CallMetadataUpdate = 0x05,
     /// Unit location report (GPS from P25 LRRP or external). Payload is JSON.
-    Location = 0x05,
+    Location = 0x06,
 }
 
 impl SubframeType {
@@ -25,7 +37,8 @@ impl SubframeType {
             0x02 => Some(Self::CallStart),
             0x03 => Some(Self::CallEnd),
             0x04 => Some(Self::StreamInfo),
-            0x05 => Some(Self::Location),
+            0x05 => Some(Self::CallMetadataUpdate),
+            0x06 => Some(Self::Location),
             _ => None,
         }
     }
@@ -36,6 +49,7 @@ impl SubframeType {
             Self::CallStart => "call_start",
             Self::CallEnd => "call_end",
             Self::StreamInfo => "stream_info",
+            Self::CallMetadataUpdate => "call_metadata_update",
             Self::Location => "location",
         }
     }
