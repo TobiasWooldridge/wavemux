@@ -15,6 +15,8 @@ boundary without depending on each other's full workspaces.
 
 - [`src/lib.rs`](src/lib.rs) for the public re-exports and crate-level format
   summary.
+- [`docs/protocol.md`](docs/protocol.md) for the binary and JSONL protocol
+  reference.
 - [`src/wire.rs`](src/wire.rs) for binary subframe headers, codecs, frame
   types, and encode/decode helpers.
 - [`src/jsonl.rs`](src/jsonl.rs) for newline-delimited JSON used by HTTP
