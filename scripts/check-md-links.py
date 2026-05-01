@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Check local links in tracked Markdown files."""
+"""Check local Markdown links in this git repository.
+
+Default mode checks only staged Markdown files for pre-commit use. External
+URLs, site-root links, and links into git submodules are accepted without
+network or cross-repo validation.
+"""
 
 from __future__ import annotations
 
@@ -15,7 +20,14 @@ from pathlib import PurePosixPath
 from urllib.parse import unquote
 
 
-SKIP_PARTS = {"target", ".git", "node_modules", "vendor", "third_party"}
+SKIP_PARTS = tuple(
+    part
+    for part in os.environ.get(
+        "MD_LINK_SKIP_PATHS", "third_party vendor node_modules"
+    ).split()
+    if part
+)
+
 SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
 REFERENCE_DEF_RE = re.compile(r"^[ ]{0,3}\[([^\]]+)\]:[ \t]*(.*)$")
 REFERENCE_LINK_RE = re.compile(r"!?\[([^\]\n]+)\]\[([^\]\n]*)\]")
@@ -35,6 +47,13 @@ class Link:
     dest: str
 
 
+@dataclass(frozen=True)
+class RepoIndex:
+    files: set[str]
+    dirs: set[str]
+    submodules: set[str]
+
+
 def run_git(repo: str, *args: str) -> str:
     proc = subprocess.run(
         ("git", "-C", repo, *args),
@@ -46,35 +65,75 @@ def run_git(repo: str, *args: str) -> str:
     return proc.stdout
 
 
+def git_bytes(repo: str, *args: str) -> bytes:
+    proc = subprocess.run(
+        ("git", "-C", repo, *args),
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    return proc.stdout
+
+
 def repo_root() -> str:
     return run_git(".", "rev-parse", "--show-toplevel").strip()
 
 
-def tracked_files(repo: str) -> set[str]:
-    out = run_git(repo, "ls-files")
-    return {line for line in out.splitlines() if line}
-
-
-def dirs_for(files: set[str]) -> set[str]:
+def load_index(repo: str) -> RepoIndex:
+    raw = git_bytes(repo, "ls-files", "-s", "-z")
+    files: set[str] = set()
     dirs: set[str] = set()
-    for path in files:
-        parts = PurePosixPath(path).parts
+    submodules: set[str] = set()
+
+    for entry in raw.split(b"\0"):
+        if not entry:
+            continue
+        meta, path_b = entry.split(b"\t", 1)
+        mode = meta.split(b" ", 1)[0].decode()
+        path = path_b.decode()
+        files.add(path)
+        if mode == "160000":
+            submodules.add(path)
+        parts = path.split("/")
         for i in range(1, len(parts)):
             dirs.add("/".join(parts[:i]))
-    return dirs
+
+    return RepoIndex(files=files, dirs=dirs, submodules=submodules)
 
 
-def markdown_files(files: set[str]) -> list[str]:
-    return sorted(
-        path
-        for path in files
-        if path.lower().endswith(".md")
-        and not any(part in SKIP_PARTS for part in PurePosixPath(path).parts)
+def staged_markdown(repo: str) -> list[str]:
+    out = run_git(
+        repo,
+        "diff",
+        "--cached",
+        "--name-only",
+        "--diff-filter=ACMR",
+        "--",
+        "*.md",
     )
+    return [line for line in out.splitlines() if line]
 
 
-def read_text(repo: str, path: str) -> str:
-    with open(os.path.join(repo, path), encoding="utf-8", errors="replace") as f:
+def all_markdown(repo: str) -> list[str]:
+    raw = git_bytes(repo, "ls-files", "-z", "--", "*.md")
+    return [p.decode() for p in raw.split(b"\0") if p]
+
+
+def skipped(path: str) -> bool:
+    parts = PurePosixPath(path).parts
+    return any(part in SKIP_PARTS for part in parts)
+
+
+def staged_content(repo: str, path: str) -> str:
+    try:
+        data = git_bytes(repo, "show", f":{path}")
+        return data.decode("utf-8", errors="replace")
+    except subprocess.CalledProcessError:
+        return read_worktree(repo, path)
+
+
+def read_worktree(repo: str, path: str) -> str:
+    with open(os.path.join(repo, path), "r", encoding="utf-8", errors="replace") as f:
         return f.read()
 
 
@@ -82,8 +141,8 @@ def iter_non_code_lines(text: str):
     fence: str | None = None
     for lineno, line in enumerate(text.splitlines(), 1):
         stripped = line.lstrip(" ")
-        marker = stripped[:3]
         indent = len(line) - len(stripped)
+        marker = stripped[:3]
         if indent <= 3 and marker in ("```", "~~~"):
             if fence is None:
                 fence = marker
@@ -92,6 +151,10 @@ def iter_non_code_lines(text: str):
             continue
         if fence is None:
             yield lineno, line
+
+
+def normalize_label(label: str) -> str:
+    return " ".join(label.strip().casefold().split())
 
 
 def parse_destination(raw: str) -> str:
@@ -106,15 +169,13 @@ def parse_destination(raw: str) -> str:
     for i, char in enumerate(value):
         if escaped:
             escaped = False
-        elif char == "\\":
+            continue
+        if char == "\\":
             escaped = True
-        elif char.isspace():
+            continue
+        if char.isspace():
             return value[:i].strip()
     return value
-
-
-def normalize_label(label: str) -> str:
-    return " ".join(label.strip().casefold().split())
 
 
 def collect_reference_defs(text: str) -> dict[str, str]:
@@ -137,6 +198,8 @@ def inline_links(source: str, lineno: int, line: str) -> list[Link]:
         start = line.find("](", i)
         if start < 0:
             return links
+
+        # Ignore escaped closing brackets.
         if start > 0 and line[start - 1] == "\\":
             i = start + 2
             continue
@@ -166,22 +229,25 @@ def inline_links(source: str, lineno: int, line: str) -> list[Link]:
 def extract_links(source: str, text: str) -> list[Link]:
     refs = collect_reference_defs(text)
     links: list[Link] = []
+
     for lineno, line in iter_non_code_lines(text):
         if REFERENCE_DEF_RE.match(line):
             continue
+
         links.extend(inline_links(source, lineno, line))
+
         for match in REFERENCE_LINK_RE.finditer(line):
             label = match.group(2) or match.group(1)
-            dest = refs.get(normalize_label(label))
-            links.append(Link(source, lineno, dest or f"[missing-ref]:{label}"))
+            norm = normalize_label(label)
+            if norm in refs:
+                links.append(Link(source, lineno, refs[norm]))
+            else:
+                links.append(Link(source, lineno, f"[missing-ref]:{label}"))
+
         for match in HTML_LINK_RE.finditer(line):
             links.append(Link(source, lineno, match.group(1).strip()))
+
     return links
-
-
-def is_external(dest: str) -> bool:
-    stripped = dest.strip()
-    return stripped.startswith("//") or stripped.startswith("/") or bool(SCHEME_RE.match(stripped))
 
 
 def split_dest(dest: str) -> tuple[str, str | None]:
@@ -194,21 +260,51 @@ def split_dest(dest: str) -> tuple[str, str | None]:
     return unquote(path), unquote(fragment or "") if fragment is not None else None
 
 
-def normalize_target(source: str, raw_path: str) -> str:
+def is_external(dest: str) -> bool:
+    if dest.startswith("[missing-ref]:"):
+        return False
+    stripped = dest.strip()
+    if not stripped or stripped.startswith("#"):
+        return False
+    if stripped.startswith("//"):
+        return True
+    if SCHEME_RE.match(stripped):
+        return True
+    if stripped.startswith("/"):
+        # In GitHub-flavored Markdown this is site-root absolute, often used
+        # for cross-repo links. Keep this checker scoped to repo-relative paths.
+        return True
+    return False
+
+
+def normalize_repo_path(source: str, raw_path: str) -> str:
     if raw_path in ("", "."):
         return source
     base = posixpath.dirname(source)
     return posixpath.normpath(posixpath.join(base, raw_path))
 
 
+def outside_repo(path: str) -> bool:
+    return path == ".." or path.startswith("../")
+
+
+def inside_submodule(path: str, submodules: set[str]) -> bool:
+    for submodule in submodules:
+        if path == submodule or path.startswith(f"{submodule}/"):
+            return True
+    return False
+
+
 def slugify(heading: str) -> str:
     heading = EXPLICIT_ID_RE.sub("", heading)
     heading = TAG_RE.sub("", heading)
-    heading = unicodedata.normalize("NFKD", heading.strip().strip("#").strip())
+    heading = heading.strip().strip("#").strip()
+    heading = unicodedata.normalize("NFKD", heading)
     heading = heading.casefold()
     heading = PUNCT_RE.sub("", heading)
     heading = re.sub(r"\s+", "-", heading.strip())
-    return re.sub(r"-+", "-", heading)
+    heading = re.sub(r"-+", "-", heading)
+    return heading
 
 
 def anchors_for(text: str) -> set[str]:
@@ -236,32 +332,37 @@ def anchors_for(text: str) -> set[str]:
 
 
 class Checker:
-    def __init__(self, repo: str):
+    def __init__(self, repo: str, use_staged_content: bool):
         self.repo = repo
-        self.files = tracked_files(repo)
-        self.dirs = dirs_for(self.files)
+        self.use_staged_content = use_staged_content
+        self.index = load_index(repo)
         self.anchor_cache: dict[str, set[str]] = {}
 
+    def file_text(self, path: str) -> str:
+        if self.use_staged_content:
+            return staged_content(self.repo, path)
+        return read_worktree(self.repo, path)
+
+    def target_exists(self, path: str) -> bool:
+        return path in self.index.files or path in self.index.dirs
+
     def markdown_target(self, path: str) -> str | None:
-        if path in self.files and path.lower().endswith(".md"):
+        if path in self.index.files and path.lower().endswith(".md"):
             return path
         readme = posixpath.join(path, "README.md")
-        if readme in self.files:
+        if readme in self.index.files:
             return readme
         return None
 
-    def target_exists(self, path: str) -> bool:
-        return path in self.files or path in self.dirs
-
-    def has_anchor(self, path: str, fragment: str | None) -> bool:
-        if fragment is None or fragment == "":
+    def has_anchor(self, path: str, fragment: str) -> bool:
+        if not fragment:
             return True
         fragment = fragment.removeprefix("user-content-")
         md_path = self.markdown_target(path)
         if md_path is None:
             return bool(LINE_FRAGMENT_RE.match(fragment))
         if md_path not in self.anchor_cache:
-            self.anchor_cache[md_path] = anchors_for(read_text(self.repo, md_path))
+            self.anchor_cache[md_path] = anchors_for(self.file_text(md_path))
         return fragment in self.anchor_cache[md_path]
 
     def validate(self, link: Link) -> str | None:
@@ -271,22 +372,30 @@ class Checker:
             return None
 
         raw_path, fragment = split_dest(link.dest)
-        target = normalize_target(link.source, raw_path)
-        if target == ".." or target.startswith("../"):
+        target = normalize_repo_path(link.source, raw_path)
+        if outside_repo(target):
+            return None
+        if inside_submodule(target, self.index.submodules):
             return None
         if not self.target_exists(target):
             return f"target does not exist: {link.dest}"
-        if not self.has_anchor(target, fragment):
+        if fragment is not None and not self.has_anchor(target, fragment):
             return f"anchor does not exist: {link.dest}"
         return None
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
         "--all",
         action="store_true",
-        help="accepted for consistency; all tracked Markdown files are checked",
+        help="check all tracked Markdown files instead of only staged files",
+    )
+    mode.add_argument(
+        "--staged",
+        action="store_true",
+        help="check staged Markdown files (default)",
     )
     parser.add_argument(
         "--repo-root",
@@ -299,11 +408,19 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
     repo = os.path.abspath(args.repo_root or repo_root())
-    checker = Checker(repo)
+    use_staged_content = not args.all
+    paths = all_markdown(repo) if args.all else staged_markdown(repo)
+    paths = [path for path in paths if not skipped(path)]
+
+    if not paths:
+        return 0
+
+    checker = Checker(repo, use_staged_content=use_staged_content)
     errors: list[tuple[Link, str]] = []
 
-    for path in markdown_files(checker.files):
-        for link in extract_links(path, read_text(repo, path)):
+    for path in paths:
+        text = checker.file_text(path)
+        for link in extract_links(path, text):
             message = checker.validate(link)
             if message:
                 errors.append((link, message))
@@ -311,9 +428,16 @@ def main(argv: list[str]) -> int:
     if errors:
         print("ERROR: broken internal Markdown link(s):", file=sys.stderr)
         for link, message in errors:
-            print(f"  {link.source}:{link.line}: {message} ({link.dest})", file=sys.stderr)
-        print("\nExternal URLs and site-root paths are not checked.", file=sys.stderr)
+            print(
+                f"  {link.source}:{link.line}: {message} ({link.dest})",
+                file=sys.stderr,
+            )
+        print(
+            "\nExternal URLs, site-root paths, and submodule paths are not checked.",
+            file=sys.stderr,
+        )
         return 1
+
     return 0
 
 
