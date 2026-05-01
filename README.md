@@ -66,10 +66,15 @@ Run the crate tests before changing protocol behavior:
 cargo test
 ```
 
-From the parent SDR checkout, the doc-hygiene checks can also validate this
-README:
+Run the local Markdown link checker before changing docs:
 
 ```bash
-python3 tools/check-md-links.py --repo-root wavemux --all
+python3 scripts/check-md-links.py --all
+```
+
+From the parent SDR checkout, the doc-hygiene README-presence check can also
+validate this repo:
+
+```bash
 python3 tools/check-dir-readmes.py --repo-root wavemux --all
 ```
