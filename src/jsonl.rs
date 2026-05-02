@@ -157,6 +157,32 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "regression for #9 - un-ignore when fixed"]
+    fn jsonl_rejects_ids_outside_wire_width() {
+        let too_large_substream = format!(
+            r#"{{"type":"call_start","substream_id":{},"source_id":1,"data":{{}}}}"#,
+            u16::MAX as u64 + 1
+        );
+        let parsed = jsonl_to_subframe(&too_large_substream);
+        assert!(
+            parsed.is_none(),
+            "over-wide substream_id must be rejected, not accepted as {}",
+            parsed.unwrap().substream_id
+        );
+
+        let too_large_source = format!(
+            r#"{{"type":"call_start","substream_id":1,"source_id":{},"data":{{}}}}"#,
+            u32::MAX as u64 + 1
+        );
+        let parsed = jsonl_to_subframe(&too_large_source);
+        assert!(
+            parsed.is_none(),
+            "over-wide source_id must be rejected, not accepted as {}",
+            parsed.unwrap().source_id
+        );
+    }
+
+    #[test]
     fn jsonl_is_single_line() {
         let sf = Subframe::audio(1, Codec::Pcm16Le, 0, vec![0; 100]);
         let line = subframe_to_jsonl(&sf);
