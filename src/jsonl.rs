@@ -33,11 +33,25 @@ pub fn subframe_to_jsonl(sf: &Subframe) -> String {
 }
 
 /// Parse a JSONL line back into a subframe.
+///
+/// `substream_id` (2-byte wire field) and `source_id` (4-byte wire
+/// field) values that don't fit their target widths are rejected
+/// rather than aliased to the low bits — a malformed or
+/// version-mismatched producer must not silently merge into
+/// substream 0 / source 0. See wavemux#9.
 pub fn jsonl_to_subframe(line: &str) -> Option<Subframe> {
     let v: serde_json::Value = serde_json::from_str(line).ok()?;
     let type_str = v.get("type")?.as_str()?;
-    let substream_id = v.get("substream_id")?.as_u64()? as u16;
-    let source_id = v.get("source_id")?.as_u64().unwrap_or(0) as u32;
+    let substream_id_u64 = v.get("substream_id")?.as_u64()?;
+    if substream_id_u64 > u16::MAX as u64 {
+        return None;
+    }
+    let substream_id = substream_id_u64 as u16;
+    let source_id_u64 = v.get("source_id").and_then(|v| v.as_u64()).unwrap_or(0);
+    if source_id_u64 > u32::MAX as u64 {
+        return None;
+    }
+    let source_id = source_id_u64 as u32;
 
     match type_str {
         "audio" => {
@@ -157,7 +171,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "regression for #9 - un-ignore when fixed"]
     fn jsonl_rejects_ids_outside_wire_width() {
         let too_large_substream = format!(
             r#"{{"type":"call_start","substream_id":{},"source_id":1,"data":{{}}}}"#,
