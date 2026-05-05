@@ -270,27 +270,88 @@ mod tests {
         assert_eq!(SUBFRAME_HEADER_SIZE, 12);
     }
 
+    /// Exhaustive on-wire byte pin + compile-time match-gate for
+    /// every `SubframeType` variant. Pre-fix this test only iterated
+    /// 4 of 6 variants — `CallMetadataUpdate` (0x05, added in
+    /// 10bc9a7 for WaveCatch#71) and `Location` (0x06) silently
+    /// dropped off the coverage when they landed. A drift-guard
+    /// closure forces a future variant addition to fail to build
+    /// until both `from_u8` and this iteration are updated.
+    ///
+    /// The numeric tags are wire-stable: WaveCatch's wavemux
+    /// emitter, wavecap's `wcap-ingest::wavemux_jsonl` parser, and
+    /// any third-party consumer all read these by raw byte.
     #[test]
-    fn all_subframe_types_roundtrip() {
-        for st in [
-            SubframeType::Audio,
-            SubframeType::CallStart,
-            SubframeType::CallEnd,
-            SubframeType::StreamInfo,
-        ] {
-            assert_eq!(SubframeType::from_u8(st as u8), Some(st));
+    fn subframe_type_wire_byte_assignments() {
+        let _exhaustive_check = |st: SubframeType| match st {
+            SubframeType::Audio
+            | SubframeType::CallStart
+            | SubframeType::CallEnd
+            | SubframeType::StreamInfo
+            | SubframeType::CallMetadataUpdate
+            | SubframeType::Location => (),
+        };
+        let cases: [(SubframeType, u8); 6] = [
+            (SubframeType::Audio, 0x01),
+            (SubframeType::CallStart, 0x02),
+            (SubframeType::CallEnd, 0x03),
+            (SubframeType::StreamInfo, 0x04),
+            (SubframeType::CallMetadataUpdate, 0x05),
+            (SubframeType::Location, 0x06),
+        ];
+        for (st, byte) in cases {
+            assert_eq!(st as u8, byte, "wire byte for {st:?} drifted");
+            assert_eq!(
+                SubframeType::from_u8(byte),
+                Some(st),
+                "from_u8({byte:#04x}) lost its mapping to {st:?}",
+            );
         }
     }
 
+    /// Mirror for `Codec`: exhaustive byte pin + match-gate. The
+    /// existing `all_codecs_roundtrip` covered all four variants but
+    /// had no compile-time gate against silently dropping one in a
+    /// future refactor.
     #[test]
-    fn all_codecs_roundtrip() {
-        for c in [
-            Codec::Pcm16Le,
-            Codec::Pcm16Le8k,
-            Codec::Opus,
-            Codec::ImbeRaw,
-        ] {
-            assert_eq!(Codec::from_u8(c as u8), Some(c));
+    fn codec_wire_byte_assignments() {
+        let _exhaustive_check = |c: Codec| match c {
+            Codec::Pcm16Le | Codec::Pcm16Le8k | Codec::Opus | Codec::ImbeRaw => (),
+        };
+        let cases: [(Codec, u8); 4] = [
+            (Codec::Pcm16Le, 0x00),
+            (Codec::Pcm16Le8k, 0x01),
+            (Codec::Opus, 0x02),
+            (Codec::ImbeRaw, 0x03),
+        ];
+        for (c, byte) in cases {
+            assert_eq!(c as u8, byte, "wire byte for {c:?} drifted");
+            assert_eq!(
+                Codec::from_u8(byte),
+                Some(c),
+                "from_u8({byte:#04x}) lost its mapping to {c:?}",
+            );
+        }
+    }
+
+    /// `SubframeType::as_str` is consumed by the JSONL emitter
+    /// (`Subframe` → newline-delimited JSON) and round-tripped by
+    /// the JSONL parser. Unlike `Codec` (which had `codec_str_roundtrip`)
+    /// `SubframeType` had no string-form coverage at all. Pin the
+    /// names so a JSONL-side rename ("call_start" → "callstart")
+    /// surfaces here instead of as a silent ingest mismatch.
+    #[test]
+    fn subframe_type_as_str_pins() {
+        let cases: [(SubframeType, &str); 6] = [
+            (SubframeType::Audio, "audio"),
+            (SubframeType::CallStart, "call_start"),
+            (SubframeType::CallEnd, "call_end"),
+            (SubframeType::StreamInfo, "stream_info"),
+            (SubframeType::CallMetadataUpdate, "call_metadata_update"),
+            (SubframeType::Location, "location"),
+        ];
+        for (st, name) in cases {
+            assert_eq!(st.as_str(), name);
         }
     }
 
