@@ -1,9 +1,7 @@
 //! Binary wire format: 12-byte subframe headers + payloads.
 
-use serde::{Deserialize, Serialize};
-
 /// Subframe type discriminant.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum SubframeType {
     /// PCM/Opus/IMBE audio samples.
@@ -56,7 +54,7 @@ impl SubframeType {
 }
 
 /// Audio codec tag.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Codec {
     /// Mono i16 little-endian, 48 kHz.
