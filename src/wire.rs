@@ -215,11 +215,20 @@ pub fn encode_subframes(subframes: &[Subframe]) -> Vec<u8> {
 }
 
 /// Decode a payload buffer into subframes.
+///
+/// Bails on the first malformed header (`SubframeHeader::decode`
+/// returned `None`) or truncated payload (`payload_len` exceeds the
+/// remaining buffer). Returns whatever subframes were decoded before
+/// the error point. All arithmetic uses `checked_add` so an
+/// adversarial buffer cannot overflow `usize` on 32-bit platforms
+/// (where `payload_len` is a u32 declared on the wire and can reach
+/// 4 GB, making `offset + payload_len` wrap to a small value that
+/// would otherwise sneak past the bounds check).
 pub fn decode_subframes(data: &[u8]) -> Vec<Subframe> {
     let mut subframes = Vec::new();
-    let mut offset = 0;
+    let mut offset = 0usize;
 
-    while offset + SUBFRAME_HEADER_SIZE <= data.len() {
+    while data.len().saturating_sub(offset) >= SUBFRAME_HEADER_SIZE {
         let hdr_bytes: &[u8; SUBFRAME_HEADER_SIZE] = data[offset..offset + SUBFRAME_HEADER_SIZE]
             .try_into()
             .unwrap();
@@ -229,7 +238,15 @@ pub fn decode_subframes(data: &[u8]) -> Vec<Subframe> {
         offset += SUBFRAME_HEADER_SIZE;
 
         let payload_len = header.payload_len as usize;
-        if offset + payload_len > data.len() {
+        // Overflow-safe bound check: `offset + payload_len` can wrap on
+        // 32-bit platforms when `payload_len` approaches u32::MAX.
+        // `checked_add` returns None on overflow, which we treat the
+        // same as "exceeds buffer".
+        let end = match offset.checked_add(payload_len) {
+            Some(end) => end,
+            None => break,
+        };
+        if end > data.len() {
             break;
         }
 
@@ -238,9 +255,9 @@ pub fn decode_subframes(data: &[u8]) -> Vec<Subframe> {
             subframe_type: header.subframe_type,
             codec: header.codec,
             source_id: header.source_id,
-            payload: data[offset..offset + payload_len].to_vec(),
+            payload: data[offset..end].to_vec(),
         });
-        offset += payload_len;
+        offset = end;
     }
 
     subframes
@@ -393,6 +410,61 @@ mod tests {
     #[test]
     fn decode_empty() {
         assert!(decode_subframes(&[]).is_empty());
+    }
+
+    /// Adversarial-input safety: a maliciously-crafted header whose
+    /// `payload_len` field claims `u32::MAX` bytes must not overflow
+    /// the offset arithmetic. On 32-bit platforms `offset + payload_len`
+    /// would wrap, and on 64-bit it would still be larger than any
+    /// real buffer; both cases must bail cleanly instead of panicking
+    /// on the slice index or running off the end.
+    #[test]
+    fn decode_handles_max_payload_len_without_overflow() {
+        // 12-byte header announcing payload_len = u32::MAX (~4 GB),
+        // followed by zero actual payload bytes.
+        let mut header = [0u8; SUBFRAME_HEADER_SIZE];
+        SubframeHeader {
+            substream_id: 1,
+            subframe_type: SubframeType::Audio,
+            codec: Codec::Pcm16Le,
+            source_id: 0,
+            payload_len: u32::MAX,
+        }
+        .encode(&mut header);
+        let decoded = decode_subframes(&header);
+        assert!(
+            decoded.is_empty(),
+            "header claiming u32::MAX payload with no actual bytes must bail",
+        );
+    }
+
+    /// Adversarial: u32::MAX payload_len AFTER a valid first subframe.
+    /// Pin that the first one parses and the second bails — confirms
+    /// the overflow guard is at the per-iteration check, not just an
+    /// early-out before the loop.
+    #[test]
+    fn decode_one_good_then_overflow_payload_keeps_first() {
+        let good = Subframe::audio(42, Codec::Pcm16Le, 0xDEAD, vec![0xAB; 8]);
+        let mut data = encode_subframes(&[good]);
+        // Append a malicious header with payload_len = u32::MAX.
+        let mut bad_header = [0u8; SUBFRAME_HEADER_SIZE];
+        SubframeHeader {
+            substream_id: 99,
+            subframe_type: SubframeType::Audio,
+            codec: Codec::Pcm16Le,
+            source_id: 0,
+            payload_len: u32::MAX,
+        }
+        .encode(&mut bad_header);
+        data.extend_from_slice(&bad_header);
+        let decoded = decode_subframes(&data);
+        assert_eq!(
+            decoded.len(),
+            1,
+            "first subframe must parse; second must bail on overflow",
+        );
+        assert_eq!(decoded[0].substream_id, 42);
+        assert_eq!(decoded[0].payload.len(), 8);
     }
 
     #[test]
