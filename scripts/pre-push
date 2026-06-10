@@ -1,0 +1,186 @@
+#!/usr/bin/env bash
+# Pre-push hook: preserve remote-branch history, then warn/block when the
+# pushed branch is cut from a stale default branch.
+# Skip freshness only with: PR_FLOW_SKIP_FRESHNESS=1 git push ...
+# Skip all hooks with:      git push --no-verify
+#
+# Install: cp scripts/pre-push .git/hooks/pre-push && chmod +x .git/hooks/pre-push
+# Or:      git config core.hooksPath scripts
+
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Build-integrity backstop (added 2026-06-09 after the gate-rot incident):
+# hosted CI is disabled by choice, so nothing beyond local hooks stops an
+# unparseable or misformatted commit (e.g. a `--no-verify` commit or a bad
+# merge) from reaching the remote. `cargo fmt --check` is sub-second and
+# fails on any file rustfmt cannot parse — exactly the failure class that
+# silently disabled every local gate for weeks (a corrupted
+# wavemaker_corpus.rs made the pre-commit fmt hook fail for ALL commits,
+# normalising --no-verify and letting further corruption land).
+# ---------------------------------------------------------------------------
+if command -v cargo >/dev/null 2>&1 && [[ -f Cargo.toml ]]; then
+    if ! cargo fmt --check --quiet 2>/dev/null; then
+        echo "error: cargo fmt --check fails in the working tree."
+        echo "A tracked file is misformatted or unparseable. Fix it (cargo fmt,"
+        echo "or repair the syntax error) and commit before pushing — pushing"
+        echo "this state would break the pre-commit hook for every checkout."
+        exit 1
+    fi
+fi
+
+remote_name="${1:-origin}"
+zero_oid="0000000000000000000000000000000000000000"
+freshness_warn_threshold=10
+freshness_block_threshold=25
+history_rejected=0
+freshness_rejected=0
+freshness_warned=0
+
+declare -a target_local_oids=()
+declare -a target_remote_branches=()
+
+ref_label() {
+    local ref="$1"
+    if [[ "$ref" == refs/heads/* ]]; then
+        printf '%s' "${ref#refs/heads/}"
+        return
+    fi
+
+    printf '%s' "$ref"
+}
+
+resolve_default_branch() {
+    local remote="$1"
+    local symref
+
+    symref="$(git symbolic-ref --quiet "refs/remotes/$remote/HEAD" 2>/dev/null || true)"
+    if [[ -n "$symref" ]]; then
+        printf '%s\n' "${symref##*/}"
+        return 0
+    fi
+
+    if git rev-parse --verify "refs/remotes/$remote/main^{commit}" >/dev/null 2>&1; then
+        printf 'main\n'
+        return 0
+    fi
+
+    if git rev-parse --verify "refs/remotes/$remote/master^{commit}" >/dev/null 2>&1; then
+        printf 'master\n'
+        return 0
+    fi
+
+    return 1
+}
+
+print_refresh_guidance() {
+    local remote="$1"
+    local default_branch="$2"
+
+    echo "Refresh with:"
+    echo "  git fetch --no-tags $remote $default_branch"
+    echo "  git rebase $remote/$default_branch   # or merge if preferred"
+    echo "Override for an intentional stale-base push:"
+    echo "  PR_FLOW_SKIP_FRESHNESS=1 git push ..."
+}
+
+while read -r local_ref local_oid remote_ref remote_oid; do
+    [[ -z "${local_ref:-}" ]] && continue
+    [[ "$local_oid" == "$zero_oid" ]] && continue
+    [[ "$remote_ref" != refs/heads/* ]] && continue
+
+    remote_branch="$(ref_label "$remote_ref")"
+    local_branch="$(ref_label "$local_ref")"
+
+    target_local_oids+=("$local_oid")
+    target_remote_branches+=("$remote_branch")
+
+    [[ "$remote_oid" == "$zero_oid" ]] && continue
+
+    if ! git cat-file -e "${remote_oid}^{commit}" 2>/dev/null; then
+        echo "error: $remote_name/$remote_branch has commits you do not have locally."
+        echo "Run 'git pull --rebase $remote_name $remote_branch' before pushing."
+        history_rejected=1
+        continue
+    fi
+
+    if ! git merge-base --is-ancestor "$remote_oid" "$local_oid"; then
+        echo "error: $remote_name/$remote_branch is not an ancestor of $local_branch."
+        echo "Integrate the remote branch before pushing."
+        history_rejected=1
+    fi
+done
+
+if [[ "$history_rejected" -ne 0 ]]; then
+    echo "pre-push: blocked to avoid overwriting remote history."
+    exit 1
+fi
+
+if [[ "${PR_FLOW_SKIP_FRESHNESS:-0}" == "1" ]]; then
+    echo "pre-push: ok (freshness check skipped via PR_FLOW_SKIP_FRESHNESS=1)"
+    exit 0
+fi
+
+if [[ "${#target_local_oids[@]}" -eq 0 ]]; then
+    echo "pre-push: ok"
+    exit 0
+fi
+
+default_branch="$(resolve_default_branch "$remote_name" || true)"
+if [[ -z "$default_branch" ]]; then
+    echo "warning: pre-push freshness: could not resolve $remote_name default branch; skipping freshness check."
+    echo "pre-push: ok"
+    exit 0
+fi
+
+if ! git fetch --quiet --no-tags --no-recurse-submodules "$remote_name" "$default_branch"; then
+    echo "warning: pre-push freshness: git fetch --no-tags $remote_name $default_branch failed; skipping freshness check."
+    echo "pre-push: ok"
+    exit 0
+fi
+
+default_ref="refs/remotes/$remote_name/$default_branch"
+if ! git rev-parse --verify "${default_ref}^{commit}" >/dev/null 2>&1; then
+    echo "warning: pre-push freshness: $remote_name/$default_branch is unavailable after fetch; skipping freshness check."
+    echo "pre-push: ok"
+    exit 0
+fi
+
+for i in "${!target_local_oids[@]}"; do
+    local_oid="${target_local_oids[$i]}"
+    remote_branch="${target_remote_branches[$i]}"
+    merge_base="$(git merge-base "$local_oid" "$default_ref" 2>/dev/null || true)"
+
+    if [[ -z "$merge_base" ]]; then
+        echo "error: $remote_branch has no common ancestor with $remote_name/$default_branch."
+        print_refresh_guidance "$remote_name" "$default_branch"
+        freshness_rejected=1
+        continue
+    fi
+
+    behind_count="$(git rev-list --count "${merge_base}..${default_ref}")"
+    if (( behind_count >= freshness_block_threshold )); then
+        echo "error: $remote_branch is based on $remote_name/$default_branch that is $behind_count commits behind."
+        print_refresh_guidance "$remote_name" "$default_branch"
+        freshness_rejected=1
+        continue
+    fi
+
+    if (( behind_count >= freshness_warn_threshold )); then
+        echo "warning: $remote_branch is based on $remote_name/$default_branch that is $behind_count commits behind."
+        print_refresh_guidance "$remote_name" "$default_branch"
+        freshness_warned=1
+    fi
+done
+
+if [[ "$freshness_rejected" -ne 0 ]]; then
+    echo "pre-push: blocked by freshness check."
+    exit 1
+fi
+
+if [[ "$freshness_warned" -ne 0 ]]; then
+    echo "pre-push: ok (freshness warning emitted)"
+    exit 0
+fi
+
+echo "pre-push: ok"
