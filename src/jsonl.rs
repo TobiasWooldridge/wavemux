@@ -10,14 +10,23 @@ use crate::wire::{Codec, Subframe, SubframeType};
 /// Serialize a subframe to a JSONL line (without trailing newline).
 pub fn subframe_to_jsonl(sf: &Subframe) -> String {
     match sf.subframe_type {
-        SubframeType::Audio => serde_json::json!({
-            "type": "audio",
-            "substream_id": sf.substream_id,
-            "source_id": sf.source_id,
-            "codec": sf.codec.as_str(),
-            "samples_b64": BASE64.encode(&sf.payload),
-        })
-        .to_string(),
+        SubframeType::Audio => {
+            let mut frame = serde_json::json!({
+                "type": "audio",
+                "substream_id": sf.substream_id,
+                "source_id": sf.source_id,
+                "codec": sf.codec.as_str(),
+                "samples_b64": BASE64.encode(&sf.payload),
+            });
+            // Additive field (WaveCatch#1854, sdr#2012): cumulative
+            // pre-frame sample position for consumer-side gap
+            // detection. Omitted when the producer doesn't track it,
+            // so pre-#1854 consumers and producers interop unchanged.
+            if let Some(pos) = sf.stream_pos {
+                frame["stream_pos"] = serde_json::json!(pos);
+            }
+            frame.to_string()
+        }
         _ => {
             let data: serde_json::Value =
                 serde_json::from_slice(&sf.payload).unwrap_or(serde_json::json!({}));
@@ -59,12 +68,25 @@ pub fn jsonl_to_subframe(line: &str) -> Option<Subframe> {
             let codec = Codec::parse_str(codec_str)?;
             let b64 = v.get("samples_b64")?.as_str()?;
             let payload = BASE64.decode(b64).ok()?;
+            // Absent = producer doesn't track positions (pre-#1854 or
+            // non-tracking path) — "no gap detection", NOT position 0.
+            // Present-but-malformed (negative, float, string, null,
+            // out-of-range) is a broken or version-mismatched producer:
+            // reject the frame like the substream_id/source_id range
+            // checks above (wavemux#9 precedent) rather than silently
+            // downgrading to untracked — a consumer must never mistake
+            // a corrupt position stream for a healthy untracked one.
+            let stream_pos = match v.get("stream_pos") {
+                None => None,
+                Some(raw) => Some(raw.as_u64()?),
+            };
             Some(Subframe {
                 substream_id,
                 subframe_type: SubframeType::Audio,
                 codec,
                 source_id,
                 payload,
+                stream_pos,
             })
         }
         "call_start" | "call_end" | "stream_info" | "call_metadata_update" | "location" => {
@@ -83,6 +105,7 @@ pub fn jsonl_to_subframe(line: &str) -> Option<Subframe> {
                 codec: Codec::Pcm16Le,
                 source_id,
                 payload: data.to_string().into_bytes(),
+                stream_pos: None,
             })
         }
         _ => None,
@@ -200,5 +223,54 @@ mod tests {
         let sf = Subframe::audio(1, Codec::Pcm16Le, 0, vec![0; 100]);
         let line = subframe_to_jsonl(&sf);
         assert!(!line.contains('\n'));
+    }
+}
+
+#[cfg(test)]
+mod stream_pos_tests {
+    use super::*;
+
+    /// WaveCatch#1854 (sdr#2012): the cumulative position round-trips
+    /// on audio frames, is omitted when untracked, and absent input
+    /// parses as None (pre-#1854 producers interop unchanged).
+    #[test]
+    fn stream_pos_round_trips_and_is_backward_compatible() {
+        let mut sf = Subframe::audio(7, Codec::Pcm16Le, 42, vec![1, 2, 3, 4]);
+        sf.stream_pos = Some(96_000);
+        let line = subframe_to_jsonl(&sf);
+        assert!(line.contains("\"stream_pos\":96000"));
+        let back = jsonl_to_subframe(&line).expect("parse");
+        assert_eq!(back.stream_pos, Some(96_000));
+        assert_eq!(back.payload, vec![1, 2, 3, 4]);
+
+        // Untracked producer: field omitted entirely.
+        let untracked = Subframe::audio(7, Codec::Pcm16Le, 42, vec![9, 9]);
+        let line = subframe_to_jsonl(&untracked);
+        assert!(!line.contains("stream_pos"));
+        assert_eq!(jsonl_to_subframe(&line).unwrap().stream_pos, None);
+
+        // Pre-#1854 consumer input (hand-built line without the field).
+        let legacy = r#"{"type":"audio","substream_id":1,"source_id":0,"codec":"pcm16le","samples_b64":"AAA="}"#;
+        assert_eq!(jsonl_to_subframe(legacy).unwrap().stream_pos, None);
+
+        // Present-but-malformed positions reject the frame (broken
+        // producer), matching the substream_id range-check policy.
+        for bad in [
+            r#"{"type":"audio","substream_id":1,"source_id":0,"codec":"pcm16le","samples_b64":"AAA=","stream_pos":-1}"#,
+            r#"{"type":"audio","substream_id":1,"source_id":0,"codec":"pcm16le","samples_b64":"AAA=","stream_pos":1.5}"#,
+            r#"{"type":"audio","substream_id":1,"source_id":0,"codec":"pcm16le","samples_b64":"AAA=","stream_pos":"7"}"#,
+            r#"{"type":"audio","substream_id":1,"source_id":0,"codec":"pcm16le","samples_b64":"AAA=","stream_pos":null}"#,
+        ] {
+            assert!(jsonl_to_subframe(bad).is_none(), "must reject: {bad}");
+        }
+
+        // Control frames never carry it.
+        let ctl = Subframe::control(
+            1,
+            SubframeType::CallStart,
+            0,
+            &serde_json::json!({"talkgroup_name": "Fire"}),
+        );
+        assert!(!subframe_to_jsonl(&ctl).contains("stream_pos"));
     }
 }
