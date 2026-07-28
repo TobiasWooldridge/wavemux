@@ -70,7 +70,16 @@ pub fn jsonl_to_subframe(line: &str) -> Option<Subframe> {
             let payload = BASE64.decode(b64).ok()?;
             // Absent = producer doesn't track positions (pre-#1854 or
             // non-tracking path) — "no gap detection", NOT position 0.
-            let stream_pos = v.get("stream_pos").and_then(|p| p.as_u64());
+            // Present-but-malformed (negative, float, string, null,
+            // out-of-range) is a broken or version-mismatched producer:
+            // reject the frame like the substream_id/source_id range
+            // checks above (wavemux#9 precedent) rather than silently
+            // downgrading to untracked — a consumer must never mistake
+            // a corrupt position stream for a healthy untracked one.
+            let stream_pos = match v.get("stream_pos") {
+                None => None,
+                Some(raw) => Some(raw.as_u64()?),
+            };
             Some(Subframe {
                 substream_id,
                 subframe_type: SubframeType::Audio,
@@ -243,6 +252,17 @@ mod stream_pos_tests {
         // Pre-#1854 consumer input (hand-built line without the field).
         let legacy = r#"{"type":"audio","substream_id":1,"source_id":0,"codec":"pcm16le","samples_b64":"AAA="}"#;
         assert_eq!(jsonl_to_subframe(legacy).unwrap().stream_pos, None);
+
+        // Present-but-malformed positions reject the frame (broken
+        // producer), matching the substream_id range-check policy.
+        for bad in [
+            r#"{"type":"audio","substream_id":1,"source_id":0,"codec":"pcm16le","samples_b64":"AAA=","stream_pos":-1}"#,
+            r#"{"type":"audio","substream_id":1,"source_id":0,"codec":"pcm16le","samples_b64":"AAA=","stream_pos":1.5}"#,
+            r#"{"type":"audio","substream_id":1,"source_id":0,"codec":"pcm16le","samples_b64":"AAA=","stream_pos":"7"}"#,
+            r#"{"type":"audio","substream_id":1,"source_id":0,"codec":"pcm16le","samples_b64":"AAA=","stream_pos":null}"#,
+        ] {
+            assert!(jsonl_to_subframe(bad).is_none(), "must reject: {bad}");
+        }
 
         // Control frames never carry it.
         let ctl = Subframe::control(
