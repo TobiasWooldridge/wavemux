@@ -153,6 +153,19 @@ pub struct Subframe {
     pub codec: Codec,
     pub source_id: u32,
     pub payload: Vec<u8>,
+    /// Cumulative samples (in the payload's own sample unit) emitted on
+    /// this substream BEFORE this frame, since producer start
+    /// (WaveCatch#1854, sdr#2012): a consumer that accumulates payload
+    /// sample counts can detect and QUANTIFY reception gaps —
+    /// reconnects, subscriber lag, producer restarts (position rewinds
+    /// to 0) — instead of conflating them with silence.
+    ///
+    /// JSONL-only: the fixed 12-byte binary header is read by raw byte
+    /// offset by third-party consumers and stays unchanged, so binary
+    /// wire consumers decode this as `None`. Producers that don't
+    /// track positions leave `None`; consumers must treat `None` as
+    /// "no gap detection available", never as position 0.
+    pub stream_pos: Option<u64>,
 }
 
 impl Subframe {
@@ -179,6 +192,7 @@ impl Subframe {
             codec,
             source_id,
             payload,
+            stream_pos: None,
         }
     }
 
@@ -195,6 +209,7 @@ impl Subframe {
             codec: Codec::Pcm16Le, // unused for control frames
             source_id,
             payload: json.to_string().into_bytes(),
+            stream_pos: None,
         }
     }
 }
@@ -254,6 +269,10 @@ pub fn decode_subframes(data: &[u8]) -> Vec<Subframe> {
             codec: header.codec,
             source_id: header.source_id,
             payload: data[offset..end].to_vec(),
+            // The fixed binary header carries no position field —
+            // binary-wire consumers get no gap detection (see the
+            // field doc).
+            stream_pos: None,
         });
         offset = end;
     }
